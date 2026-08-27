@@ -1,0 +1,14 @@
+OBJ/
+USER/Listings/
+USER/*.uvguix.*
+USER/JLinkSettings.ini
+
+*.axf
+*.hex
+*.o
+*.d
+*.crf
+*.map
+*.lst
+*.dep
+*.lnp
