@@ -1,0 +1,7 @@
+import("//build/lite/config/component/lite_component.gni")
+
+lite_component("app") {
+  features = [
+    "7.0_I2c_Ssd1306:I2c_Ssd1306",
+  ]
+}

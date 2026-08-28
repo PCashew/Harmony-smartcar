@@ -12,7 +12,7 @@ BUAA 软件学院小学期学习记录与智能小车项目代码。
 ├── 4_PWM驱动电机/           # PWM 电机驱动实验
 ├── 5_Timer编码器测速/       # TIM2/TIM3 双轮编码器测速
 ├── 6_PID电机闭环控制/      # 双轮电机 PI 闭环与同步控制
-├── openhermony/             # OpenHarmony LiteOS-M / Paho MQTT 资料
+├── openhermony/             # OpenHarmony LiteOS-M、OLED 与 Paho MQTT 资料
 ├── 学习日志/
 │   ├── 2026-08-25.md
 │   ├── 2026-08-26.md
@@ -57,6 +57,11 @@ BUAA 软件学院小学期学习记录与智能小车项目代码。
 - 保存 OpenHarmony LiteOS-M 平台的 Paho Embedded MQTT 学习代码。
 - 平台适配文件位于 `openhermony/harmony_share/paho_mqtt/MQTTClient-C/src/liteOS/`。
 - 包含 MQTTPacket、C/C++ MQTTClient、`BUILD.gn` 和 `bundle.json` 等内容。
+
+### Hi3861 OLED 显示
+
+- [OLED 初始显示与最终动态小猫版本](openhermony/oled-hi3861/README.md)
+- 保存可直接用 HiBurn 烧录的固件，并附最终版 SSD1306/I2C 源码与构建配置。
 
 ## 🔧 开发环境
 
