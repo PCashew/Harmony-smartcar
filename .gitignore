@@ -1,0 +1,23 @@
+# Keil build outputs
+**/OBJ/
+**/Listings/
+*.axf
+*.crf
+*.d
+*.hex
+*.htm
+*.lnp
+*.o
+*.dep
+
+# Keil user-specific settings
+*.uvguix.*
+*.uvoptx
+JLinkSettings.ini
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

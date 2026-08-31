@@ -1,87 +1,66 @@
-# Harmony-smartcar
+# 智能小车项目合集
 
-BUAA 软件学院小学期学习记录与智能小车项目代码。
+本仓库整理了智能小车课程中的 STM32 与 Harmony/OpenHarmony 代码。项目按平台划分为两个独立板块，便于查找、学习和维护。
 
-本仓库用于记录个人学习过程、课程实验、嵌入式编程实践及项目成果，并通过 Git 持续管理不同阶段的学习内容。
-
-## 📁 仓库目录
+## 目录结构
 
 ```text
 .
-├── 2_串口收发打印/          # 串口通信实验
-├── 4_PWM驱动电机/           # PWM 电机驱动实验
-├── 5_Timer编码器测速/       # TIM2/TIM3 双轮编码器测速
-├── 6_PID电机闭环控制/      # 双轮电机 PI 闭环与同步控制
-├── openhermony/             # OpenHarmony LiteOS-M、OLED 与 Paho MQTT 资料
-├── 学习日志/
-│   ├── 2026-08-25.md
-│   ├── 2026-08-26.md
-│   ├── 2026-08-27.md
-│   └── 2026-08-28.md
-├── .gitignore
-└── README.md
+├── STM32/                         # STM32F10x + Keil 工程
+│   ├── 1_工程模板_跑马灯/
+│   ├── 2_串口收发打印/
+│   ├── 4_PWM驱动电机/
+│   ├── 5_Timer编码器测速/
+│   └── 6_PID电机闭环控制/
+└── Harmony/                       # Harmony/OpenHarmony 模块
+    ├── 3_SG90舵机互斥/
+    ├── 4_HCSR04超声波测距/
+    ├── harmony_share/
+    │   └── paho_mqtt/
+    └── oled-hi3861/                # OLED 显示示例与固件
+├── 学习日志/                       # 课程学习记录
+├── README.md
+└── .gitignore
 ```
 
-## 📚 学习日志
+## STM32
 
-用于记录每日学习内容、实验过程、遇到的问题以及阶段总结。
+STM32 板块包含基于 STM32F10x 标准外设库和 Keil MDK 的控制端工程。
 
-- [2026-08-25 学习日志](学习日志/2026-08-25.md)
-- [2026-08-26 学习日志](学习日志/2026-08-26.md)
-- [2026-08-27 学习日志](学习日志/2026-08-27.md)
-- [2026-08-28 学习日志：Hi3861 OLED 动态小猫](学习日志/2026-08-28.md)
-
-## 💻 项目与实验
-
-### 2. 串口收发打印
-
-练习 STM32 串口初始化、数据收发与调试信息输出。
-
-### 4. PWM 驱动电机
-
-使用定时器 PWM 控制电机转速，为闭环控制准备执行器基础。
-
-### 5. Timer 编码器测速
-
-- TIM2 使用 PA0、PA1，TIM3 使用 PA6、PA7，均工作在编码器接口模式。
-- 以固定采样周期读取并清零计数器。
-- 通过 USART1 输出左右轮测速结果，便于观察和标定。
-
-### 6. PID 电机闭环控制
-
-- TIM4 双通道输出 PWM，编码器提供左右轮速度反馈。
-- 使用带前馈的增量 PI 调速。
-- 根据左右轮速度差和累计行程差进行同步纠偏。
-- 支持起步斜坡、PWM 限幅、定时前进/后退和 LED 状态效果。
-
-### OpenHarmony 与 MQTT
-
-- 保存 OpenHarmony LiteOS-M 平台的 Paho Embedded MQTT 学习代码。
-- 平台适配文件位于 `openhermony/harmony_share/paho_mqtt/MQTTClient-C/src/liteOS/`。
-- 包含 MQTTPacket、C/C++ MQTTClient、`BUILD.gn` 和 `bundle.json` 等内容。
-
-### Hi3861 OLED 显示
-
-- [OLED 初始显示与最终动态小猫版本](openhermony/oled-hi3861/README.md)
-- 保存可直接用 HiBurn 烧录的固件，并附最终版 SSD1306/I2C 源码与构建配置。
-- 使用 I2C0（GPIO9/SCL、GPIO10/SDA）驱动 128×64 SSD1306，最终动画为 16 帧、90 ms/帧。
-
-## 🔧 开发环境
-
-| 工具 / 环境 | 用途 |
+| 项目 | 内容 |
 | --- | --- |
-| VS Code | 代码编辑与仓库维护 |
-| Keil MDK | STM32 工程开发与编译 |
-| ST-Link | 程序烧录与调试 |
-| STM32F10x 标准外设库 | MCU 外设开发 |
-| OpenHarmony / LiteOS-M | 嵌入式系统与组件移植 |
-| HiBurn | Hi3861 固件烧录 |
-| Git / GitHub | 版本控制与学习记录管理 |
+| [1_工程模板_跑马灯](STM32/1_工程模板_跑马灯/) | 基础工程模板与跑马灯示例 |
+| [2_串口收发打印](STM32/2_串口收发打印/) | USART 串口收发与调试输出 |
+| [4_PWM驱动电机](STM32/4_PWM驱动电机/) | 使用 PWM 驱动直流电机 |
+| [5_Timer编码器测速](STM32/5_Timer编码器测速/) | 定时器与编码器测速 |
+| [6_PID电机闭环控制](STM32/6_PID电机闭环控制/) | 电机 PID 闭环控制 |
 
-## 📌 仓库说明
+工程入口通常位于各项目的 `USER` 目录，可使用 Keil 打开其中的 `.uvprojx` 工程文件。
 
-学习日志按照日期记录，实验代码按照学习进度编号管理。各工程保留原有目录层级；在实车编译、烧录和运行前，需要根据电机接线、编码器方向及机械差异重新标定控制参数。
+## Harmony
 
-```text
-学习 → 实践 → 代码 → 记录 → 版本管理 → 持续更新
-```
+Harmony 板块包含 OpenHarmony 设备端功能模块与共享组件。
+
+| 项目 | 内容 |
+| --- | --- |
+| [3_SG90舵机互斥](Harmony/3_SG90舵机互斥/) | SG90 舵机控制与互斥处理 |
+| [4_HCSR04超声波测距](Harmony/4_HCSR04超声波测距/) | HCSR04 超声波测距与 Tick 计时 |
+| [harmony_share/paho_mqtt](Harmony/harmony_share/paho_mqtt/) | Paho MQTT 通信组件 |
+| [oled-hi3861](Harmony/oled-hi3861/) | Hi3861 OLED 文字与动画显示示例 |
+
+SG90 与 HCSR04 目录包含 `BUILD.gn`，应作为 Harmony/OpenHarmony 构建模块使用。
+
+## 学习日志
+
+课程学习过程与实验记录统一保存在 [学习日志](学习日志/) 目录中。
+
+## 开发环境
+
+- STM32：Keil MDK、STM32F10x 标准外设库、ST-Link
+- Harmony/OpenHarmony：OpenHarmony 构建环境、GN、MQTT
+
+## 使用说明
+
+1. 根据开发平台进入 `STM32` 或 `Harmony` 目录。
+2. STM32 工程通过对应的 `.uvprojx` 文件打开。
+3. Harmony 模块根据目标 OpenHarmony 工程的组件配置接入，并通过 `BUILD.gn` 参与构建。
