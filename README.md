@@ -15,7 +15,7 @@
 └── Harmony/                       # Harmony/OpenHarmony 模块
     ├── 3_SG90舵机互斥/
     ├── 4_HCSR04超声波测距/
-    ├── 8.0_Sht20/
+    ├── 8_SHT20温湿度与OLED显示/
     ├── harmony_share/
     │   └── paho_mqtt/
     └── oled-hi3861/                # OLED 显示示例与固件
@@ -46,7 +46,7 @@ Harmony 板块包含 OpenHarmony 设备端功能模块与共享组件。
 | --- | --- |
 | [3_SG90舵机互斥](Harmony/3_SG90舵机互斥/) | SG90 舵机控制与互斥处理 |
 | [4_HCSR04超声波测距](Harmony/4_HCSR04超声波测距/) | HCSR04 超声波测距与 Tick 计时 |
-| [8.0_Sht20](Harmony/8.0_Sht20/) | SHT20 温湿度采集与 SSD1306 OLED 显示 |
+| [8_SHT20温湿度与OLED显示](Harmony/8_SHT20温湿度与OLED显示/) | SHT20 温湿度采集与 SSD1306 OLED 显示 |
 | [harmony_share/paho_mqtt](Harmony/harmony_share/paho_mqtt/) | Paho MQTT 通信组件 |
 | [oled-hi3861](Harmony/oled-hi3861/) | Hi3861 OLED 文字与动画显示示例 |
 

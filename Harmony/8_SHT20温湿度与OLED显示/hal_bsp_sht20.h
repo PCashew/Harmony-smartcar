@@ -28,3 +28,4 @@ uint32_t SHT20_Init(void);
 
 #endif // !__HAL_BSP_SHT20_H__
 
+
