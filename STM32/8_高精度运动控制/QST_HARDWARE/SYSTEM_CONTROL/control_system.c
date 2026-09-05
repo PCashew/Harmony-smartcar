@@ -51,6 +51,8 @@ static volatile u8 path_sample_ticks;
 static volatile s32 path_accum_left;
 static volatile s32 path_accum_right;
 static volatile s32 retrace_remaining_counts;
+static volatile s32 encoder_left_counts;
+static volatile s32 encoder_right_counts;
 
 static void ResetControllers(void);
 
@@ -418,6 +420,8 @@ void Motion_ControlTick(void)
     sample_mode = mode;
     measured_left = (s16)Read_Encoder(2);
     measured_right = (s16)Read_Encoder(3);
+    encoder_left_counts += measured_left;
+    encoder_right_counts += measured_right;
     PathRecord(measured_left, measured_right, sample_mode);
     position_left += measured_left;
     position_right += measured_right;
@@ -499,6 +503,23 @@ u8 Motion_GetEvent(u8 *command, u8 *seq, u8 *status)
     __enable_irq();
     CarLight_Stop();
     return 1;
+}
+
+void Motion_GetEncoderMm(s16 *left_mm, s16 *right_mm)
+{
+    s32 left_counts;
+    s32 right_counts;
+    float circumference_mm;
+
+    __disable_irq();
+    left_counts = encoder_left_counts;
+    right_counts = encoder_right_counts;
+    __enable_irq();
+    circumference_mm = ((float)CAR_WHEEL_DIAMETER_X100_MM / 100.0f) * 3.1415926f;
+    *left_mm = ClampToS16((s32)((float)left_counts * circumference_mm /
+                               (float)CAR_ENCODER_COUNTS_PER_REV));
+    *right_mm = ClampToS16((s32)((float)right_counts * circumference_mm /
+                                (float)CAR_ENCODER_COUNTS_PER_REV));
 }
 
 void SysTick_Handler(void)

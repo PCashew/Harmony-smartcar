@@ -1,455 +1,824 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <memory.h>
+#include <stdint.h>
 #include "wifiiot_uart.h"
 #include "ohos_init.h"
 #include "cmsis_os2.h"
 #include "wifiiot_gpio.h"
+#include "wifiiot_gpio_ex.h"
 #include "hi_io.h"
 #include "hi_time.h"
-#include "wifiiot_pwm.h"
-#include "hi_pwm.h"
-#include "hi_uart.h"
-#include "wifiiot_gpio_ex.h"
 #include "hi_task.h"
 
+#define IR_LEFT_GPIO                       13
+#define IR_RIGHT_GPIO                      14
 
-//查阅机器人板原理图可知
-//左边的红外传感器与3861芯片的GPIO13连接
-//右边的红外传感器与3861芯片的GPIO14连接
-#define GPIOL 13
-#define GPIOR 14
-#define GPIO_FUNC 0
+#define PROTOCOL_SIZE                      10
+#define PROTOCOL_HEAD_0                  0xA5
+#define PROTOCOL_HEAD_1                  0x5A
+#define PROTOCOL_TAIL                    0x0D
+#define CMD_STOP                         0x01
+#define CMD_SET_SPEED                    0x02
+#define CMD_MOVE_DISTANCE                0x03
+#define CMD_TURN_ANGLE                   0x04
+#define CMD_GET_ENCODERS                 0x07
+#define STATUS_DONE                      0x02
 
-#define CONTROL_PERIOD_MS 30
-#define CORRECTION_CONFIRM_SAMPLES 2
-#define STRONG_CORRECTION_SAMPLES 6
-#define EVENT_CONFIRM_SAMPLES 4
-#define CLEAR_CONFIRM_SAMPLES 3
+#define LINE_DEBUG                          1
+#define SENSOR_SAMPLE_MS                    5
+#define SENSOR_FILTER_COUNT                 5
+#define SENSOR_FILTER_THRESHOLD             3
+#define DEBUG_PERIOD_SAMPLES               40
 
-#define JUNCTION_TURN_MIN_SAMPLES 10
-#define JUNCTION_TURN_MAX_SAMPLES 35
-#define JUNCTION_CENTER_SAMPLES 3
-#define JUNCTION_EDGE_CONFIRM_SAMPLES 2
-#define RECENTER_HOLD_SAMPLES 0
-#define MIN_STAGE_RUN_SAMPLES 20
-#define FINISH_SECOND_BAR_MAX_SAMPLES 200
+/* All values below need final calibration on the real course. */
+#define SOFT_ADJUST_SAMPLES                 3
+#define NORMAL_ADJUST_SAMPLES              10
+#define LOST_MEMORY_SAMPLES                 2
+#define EVENT_WINDOW_SAMPLES               20
+#define EVENT_SIDE_MIN_HITS                 3
+#define EVENT_REARM_WHITE_SAMPLES           5
+#define JUNCTION_LOCK_SAMPLES             200
+#define START_FINISH_GAP_MAX_SAMPLES      500
+#define MIN_RACE_SAMPLES                  800
 
-#define FORWARD_SPEED 40
-#define CORRECTION_INNER_SPEED 36
-#define CORRECTION_OUTER_SPEED 50
-#define STRONG_CORRECTION_INNER_SPEED 25
-#define STRONG_CORRECTION_OUTER_SPEED 65
-#define JUNCTION_INNER_SPEED 30
-#define JUNCTION_OUTER_SPEED 75
+#define BASE_SPEED_MM_S                    80
+#define START_SPEED_MM_S                   60
+#define SOFT_INNER_SPEED_MM_S              70
+#define SOFT_OUTER_SPEED_MM_S              90
+#define NORMAL_INNER_SPEED_MM_S            58
+#define NORMAL_OUTER_SPEED_MM_S           100
+#define STRONG_INNER_SPEED_MM_S            38
+#define STRONG_OUTER_SPEED_MM_S           115
+#define SPEED_HEARTBEAT_SAMPLES            20
 
-uint8_t uart_sendbuf[20];
+#define JUNCTION_CENTER_MM                 35
+#define DEAD_END_PROBE_MM                  30
+#define POSITION_SPEED_MM_S                70
+#define SEARCH_BLACK_SAMPLES                2
+#define SEARCH_WHITE_SAMPLES                2
+#define SEARCH_TIMEOUT_SAMPLES            600
+#define CENTER_BASE_MM_S                   45
+#define CENTER_DELTA_MM_S                  10
+#define CENTER_BLACK_SAMPLES                3
+#define CENTER_ENCODER_POLL_SAMPLES         5
+#define CENTER_MAX_METRIC_MM               40
+#define CENTER_TIMEOUT_SAMPLES            300
+#define TURN_BACK_X10_DEG                 1800
+#define COMMAND_TIMEOUT_MS               15000
 
-WifiIotGpioValue io_status_left;
-WifiIotGpioValue io_status_right;
+#define SEEN_LEFT                        0x01
+#define SEEN_RIGHT                       0x02
+#define ROUTE_COUNT                         3
 
-/***通信协议***/
-/*
-发送至stm32的数据协议
-参数：电机A/B速度rad/s的一百倍，例如设置转速为1rad/s则传入100
-*/
-void stm32motor_control(int motorA, int motorB)
-{
-    uint8_t A_dir = 0;
-    uint8_t B_dir = 0;
-    //确认旋转方向 正转：0 反转 1
-    if(motorA<0){
-        A_dir=1;
-        motorA = -motorA;
-    }else{
-        A_dir=0;
-    }
-    if(motorB<0){
-        B_dir=1;
-        motorB = -motorB;
-    }else{
-        B_dir=0;
-    }
-    //限制幅度 -150 ~150
-    if (motorA > 150)
-    {
-        motorA = 150;
-    }
-    if (motorB > 150)
-    {
-        motorB = 150;
-    }
-
-    // 数据协议
-    uart_sendbuf[0] = 0xFC;   // 帧头
-    uart_sendbuf[1] = A_dir;  // 电机A方向    0正转，1反转
-    uart_sendbuf[2] = motorA; // 电机A速度
-    uart_sendbuf[3] = B_dir;  // 电机B方向    0正转，1反转
-    uart_sendbuf[4] = motorB; // 电机B速度
-    uart_sendbuf[5] = 0xFD;   // 帧尾
-    UartWrite(WIFI_IOT_UART_IDX_2, (unsigned char *)uart_sendbuf, 6);
-}
-
-// 小车后退
-void car_backward(void)
-{
-    stm32motor_control(-FORWARD_SPEED, -FORWARD_SPEED);
-}
-
-// 小车前进
-void car_forward(void)
-{
-    stm32motor_control(FORWARD_SPEED, FORWARD_SPEED);
-}
-
-// 小车左转 循迹使用
-void car_left_tra(void)
-{
-    stm32motor_control(CORRECTION_OUTER_SPEED, CORRECTION_INNER_SPEED);
-}
-
-// 小车右转 循迹使用
-void car_right_tra(void)
-{
-    stm32motor_control(CORRECTION_INNER_SPEED, CORRECTION_OUTER_SPEED);
-}
-
-static void car_left_strong(void)
-{
-    stm32motor_control(STRONG_CORRECTION_OUTER_SPEED,
-                       STRONG_CORRECTION_INNER_SPEED);
-}
-
-static void car_right_strong(void)
-{
-    stm32motor_control(STRONG_CORRECTION_INNER_SPEED,
-                       STRONG_CORRECTION_OUTER_SPEED);
-}
-
-static void car_left_junction(void)
-{
-    stm32motor_control(JUNCTION_OUTER_SPEED, JUNCTION_INNER_SPEED);
-}
-
-static void car_right_junction(void)
-{
-    stm32motor_control(JUNCTION_INNER_SPEED, JUNCTION_OUTER_SPEED);
-}
-
-// 小车停止
-void car_stop(void)
-{
-    stm32motor_control(0, 0);
-}
+typedef enum { DIR_LEFT = -1, DIR_RIGHT = 1 } Direction;
 
 typedef enum {
-    FOLLOW_FORWARD,
-    FOLLOW_LEFT,
-    FOLLOW_RIGHT,
-    FOLLOW_SPECIAL
+    ACTION_FORWARD,
+    ACTION_LEFT,
+    ACTION_RIGHT,
+    ACTION_SPECIAL
 } FollowAction;
 
 typedef enum {
-    ROUTE_FIRST_JUNCTION,
-    ROUTE_SECOND_JUNCTION,
-    ROUTE_FINISH,
-    ROUTE_DONE
-} RouteStage;
+    STATE_WAIT_START,
+    STATE_FOLLOW,
+    STATE_EVENT_CANDIDATE,
+    STATE_EVENT_CHECK,
+    STATE_JUNCTION,
+    STATE_MOVE_TO_JUNCTION_CENTER,
+    STATE_SEARCH_LEFT_WAIT_BLACK,
+    STATE_SEARCH_LEFT_ON_BLACK,
+    STATE_SEARCH_LEFT_EXIT,
+    STATE_SEARCH_RIGHT_WAIT_BLACK,
+    STATE_SEARCH_RIGHT_ON_BLACK,
+    STATE_SEARCH_RIGHT_EXIT,
+    STATE_CENTER_SCAN_OPPOSITE,
+    STATE_CENTER_RETURN_HALF,
+    STATE_CENTER_DONE,
+    STATE_CENTER_FAIL,
+    STATE_SEARCH_FAIL,
+    STATE_DEAD_END,
+    STATE_DEAD_END_PROBE,
+    STATE_TURN_BACK,
+    STATE_RETURNING,
+    STATE_RETURN_JUNCTION,
+    STATE_FINISH,
+    STATE_FAULT
+} CarState;
 
-static FollowAction last_correction = FOLLOW_FORWARD;
-static unsigned int correction_hold = 0;
+typedef struct {
+    uint8_t leftHistory;
+    uint8_t rightHistory;
+    uint8_t samples;
+} SensorFilter;
 
-static FollowAction classify_sensors(WifiIotGpioValue left, WifiIotGpioValue right)
+typedef struct {
+    uint8_t active;
+    uint8_t armed;
+    uint8_t seenMask;
+    uint8_t leftHits;
+    uint8_t rightHits;
+    uint16_t samples;
+    uint8_t clearSamples;
+} EventWindow;
+
+typedef struct {
+    uint8_t active;
+    uint8_t command;
+    uint8_t seq;
+    uint8_t seenVersion;
+    uint16_t samples;
+} MotionWait;
+
+static const Direction g_route[ROUTE_COUNT] = {
+    DIR_LEFT, DIR_RIGHT, DIR_RIGHT
+};
+static volatile uint8_t g_ackCommand;
+static volatile uint8_t g_ackSeq;
+static volatile uint8_t g_ackStatus;
+static volatile uint8_t g_ackVersion;
+static volatile int16_t g_encoderLeftMm;
+static volatile int16_t g_encoderRightMm;
+static volatile uint8_t g_encoderVersion;
+static uint8_t g_nextSeq = 1;
+static int16_t g_lastLeftSpeed = 32767;
+static int16_t g_lastRightSpeed = 32767;
+static uint16_t g_speedHeartbeat;
+static SensorFilter g_filter;
+static EventWindow g_event;
+static MotionWait g_motion;
+
+static uint8_t Checksum(const uint8_t *frame)
 {
-    // LOW means black tape; gray floor and white tape are both HIGH.
-    // The narrow black line runs between the probes while centered.
-    if (left == WIFI_IOT_GPIO_VALUE0 && right == WIFI_IOT_GPIO_VALUE0) {
-        return FOLLOW_SPECIAL;
-    }
-    if (right == WIFI_IOT_GPIO_VALUE0) {
-        return FOLLOW_RIGHT;
-    }
-    if (left == WIFI_IOT_GPIO_VALUE0) {
-        return FOLLOW_LEFT;
-    }
-    return FOLLOW_FORWARD;
+    uint8_t value = 0;
+    unsigned int i;
+    for (i = 0; i < 8; ++i) value ^= frame[i];
+    return value;
 }
 
-static FollowAction confirm_lane_action(FollowAction action,
-                                        FollowAction *candidate,
-                                        unsigned int *samples)
+static uint8_t SendCommand(uint8_t command, int16_t param1, int16_t param2)
 {
-    if (action != FOLLOW_LEFT && action != FOLLOW_RIGHT) {
-        *candidate = FOLLOW_FORWARD;
-        *samples = 0;
-        return action;
-    }
-
-    if (action != *candidate) {
-        *candidate = action;
-        *samples = 1;
-        return FOLLOW_FORWARD;
-    }
-
-    if (*samples < STRONG_CORRECTION_SAMPLES) {
-        (*samples)++;
-    }
-    return *samples >= CORRECTION_CONFIRM_SAMPLES ? action : FOLLOW_FORWARD;
+    uint8_t frame[PROTOCOL_SIZE];
+    uint8_t seq = g_nextSeq++;
+    if (g_nextSeq == 0) g_nextSeq = 1;
+    frame[0] = PROTOCOL_HEAD_0;
+    frame[1] = PROTOCOL_HEAD_1;
+    frame[2] = command;
+    frame[3] = seq;
+    frame[4] = (uint8_t)((uint16_t)param1 & 0xffU);
+    frame[5] = (uint8_t)(((uint16_t)param1 >> 8) & 0xffU);
+    frame[6] = (uint8_t)((uint16_t)param2 & 0xffU);
+    frame[7] = (uint8_t)(((uint16_t)param2 >> 8) & 0xffU);
+    frame[8] = Checksum(frame);
+    frame[9] = PROTOCOL_TAIL;
+    (void)UartWrite(WIFI_IOT_UART_IDX_2, frame, sizeof(frame));
+    return seq;
 }
 
-static int route_logic_self_check(void)
+static void StopCar(void)
 {
-    FollowAction candidate = FOLLOW_FORWARD;
-    unsigned int samples = 0;
-    int filter_ok =
-        confirm_lane_action(FOLLOW_LEFT, &candidate, &samples) == FOLLOW_FORWARD &&
-        confirm_lane_action(FOLLOW_LEFT, &candidate, &samples) == FOLLOW_LEFT;
+    (void)SendCommand(CMD_STOP, 0, 0);
+    hi_sleep(5);
+    (void)SendCommand(CMD_STOP, 0, 0);
+    g_lastLeftSpeed = 32767;
+    g_lastRightSpeed = 32767;
+}
 
-    for (unsigned int i = samples; i < STRONG_CORRECTION_SAMPLES; i++) {
-        confirm_lane_action(FOLLOW_LEFT, &candidate, &samples);
+static void SetSpeed(int16_t left, int16_t right)
+{
+    if (left != g_lastLeftSpeed || right != g_lastRightSpeed ||
+        ++g_speedHeartbeat >= SPEED_HEARTBEAT_SAMPLES) {
+        (void)SendCommand(CMD_SET_SPEED, left, right);
+        g_lastLeftSpeed = left;
+        g_lastRightSpeed = right;
+        g_speedHeartbeat = 0;
     }
-
-    return classify_sensors(WIFI_IOT_GPIO_VALUE1, WIFI_IOT_GPIO_VALUE1) == FOLLOW_FORWARD &&
-           classify_sensors(WIFI_IOT_GPIO_VALUE0, WIFI_IOT_GPIO_VALUE1) == FOLLOW_LEFT &&
-           classify_sensors(WIFI_IOT_GPIO_VALUE1, WIFI_IOT_GPIO_VALUE0) == FOLLOW_RIGHT &&
-           classify_sensors(WIFI_IOT_GPIO_VALUE0, WIFI_IOT_GPIO_VALUE0) == FOLLOW_SPECIAL &&
-           filter_ok && samples == STRONG_CORRECTION_SAMPLES;
 }
 
-static FollowAction read_sensors(void)
+static void StartMotion(uint8_t command, int16_t value, int16_t speed)
 {
-    GpioGetInputVal(GPIOL,&io_status_left); //获取GPIO13引脚的输入电平值
-    GpioGetInputVal(GPIOR,&io_status_right);//获取GPIO14引脚的输入电平值
-    return classify_sensors(io_status_left, io_status_right);
+    g_lastLeftSpeed = 32767;
+    g_lastRightSpeed = 32767;
+    g_motion.active = 1;
+    g_motion.command = command;
+    g_motion.seenVersion = g_ackVersion;
+    g_motion.samples = 0;
+    g_motion.seq = SendCommand(command, value, speed);
 }
 
-static int take_junction(int turn_left)
+/* 1=done, 0=running, -1=error/timeout. Never blocks sensor updates. */
+static int MotionUpdate(void)
 {
-    unsigned int centered = 0;
-    unsigned int edge_count = 0;
-
-    // ponytail: two sensors can reacquire the selected branch but cannot
-    // measure heading; keep the timeout and use encoders if this ceiling matters.
-    for (unsigned int sample = 0; sample < JUNCTION_TURN_MAX_SAMPLES; sample++) {
-        if (turn_left) {
-            car_left_junction();
-        } else {
-            car_right_junction();
-        }
-        hi_sleep(CONTROL_PERIOD_MS);
-
-        FollowAction action = read_sensors();
-        if ((turn_left && action == FOLLOW_LEFT) ||
-            (!turn_left && action == FOLLOW_RIGHT)) {
-            if (edge_count < JUNCTION_EDGE_CONFIRM_SAMPLES) {
-                edge_count++;
-            }
-        } else if (action != FOLLOW_FORWARD) {
-            edge_count = 0;
-        }
-
-        if (sample >= JUNCTION_TURN_MIN_SAMPLES &&
-            edge_count >= JUNCTION_EDGE_CONFIRM_SAMPLES &&
-            action == FOLLOW_FORWARD) {
-            if (++centered >= JUNCTION_CENTER_SAMPLES) {
+    if (!g_motion.active) return -1;
+    if (g_ackVersion != g_motion.seenVersion) {
+        g_motion.seenVersion = g_ackVersion;
+        if (g_ackCommand == (uint8_t)(g_motion.command | 0x80U) &&
+            g_ackSeq == g_motion.seq) {
+            if (g_ackStatus == STATUS_DONE) {
+                g_motion.active = 0;
                 return 1;
             }
-        } else {
-            centered = 0;
+            if (g_ackStatus > STATUS_DONE) {
+                g_motion.active = 0;
+                return -1;
+            }
         }
     }
-
+    if (++g_motion.samples >= (COMMAND_TIMEOUT_MS / SENSOR_SAMPLE_MS)) {
+        g_motion.active = 0;
+        return -1;
+    }
     return 0;
 }
 
-static void follow_lane(FollowAction action, unsigned int sustained_samples)
+static uint16_t EncoderTurnMetric(int16_t startLeft, int16_t startRight,
+                                  int16_t nowLeft, int16_t nowRight)
 {
-    if (action == FOLLOW_LEFT || action == FOLLOW_RIGHT) {
-        last_correction = action;
-        correction_hold = RECENTER_HOLD_SAMPLES;
-    }
+    int32_t delta = ((int32_t)nowLeft - startLeft) -
+                    ((int32_t)nowRight - startRight);
+    return (uint16_t)(delta < 0 ? -delta : delta);
+}
 
-    if (action == FOLLOW_LEFT) {
-        if (sustained_samples >= STRONG_CORRECTION_SAMPLES) {
-            car_left_strong();
-        } else {
-            car_left_tra();
+static void RequestEncoders(void)
+{
+    (void)SendCommand(CMD_GET_ENCODERS, 0, 0);
+}
+
+static void UartReceiveTask(void *argument)
+{
+    uint8_t frame[PROTOCOL_SIZE];
+    unsigned int index = 0;
+    uint8_t byte;
+    int result;
+    (void)argument;
+    while (1) {
+        result = UartRead(WIFI_IOT_UART_IDX_2, &byte, 1);
+        if (result <= 0) {
+            hi_sleep(1);
+            continue;
         }
-    } else if (action == FOLLOW_RIGHT) {
-        if (sustained_samples >= STRONG_CORRECTION_SAMPLES) {
-            car_right_strong();
-        } else {
-            car_right_tra();
+        if (index == 0 && byte != PROTOCOL_HEAD_0) continue;
+        if (index == 1 && byte != PROTOCOL_HEAD_1) {
+            index = (byte == PROTOCOL_HEAD_0) ? 1U : 0U;
+            frame[0] = byte;
+            continue;
         }
-    } else if (last_correction == FOLLOW_LEFT && correction_hold > 0) {
-        correction_hold--;
-        car_left_tra();
-    } else if (last_correction == FOLLOW_RIGHT && correction_hold > 0) {
-        correction_hold--;
-        car_right_tra();
-    } else {
-        // ponytail: white/white is both centered and fully lost with two binary
-        // probes. Drive straight; extra hardware is required to distinguish it.
-        last_correction = FOLLOW_FORWARD;
-        car_forward();
+        frame[index++] = byte;
+        if (index < PROTOCOL_SIZE) continue;
+        index = 0;
+        if (frame[9] != PROTOCOL_TAIL || frame[8] != Checksum(frame)) continue;
+        if (frame[2] == (uint8_t)(CMD_GET_ENCODERS | 0x80U)) {
+            g_encoderLeftMm = (int16_t)((uint16_t)frame[4] |
+                              ((uint16_t)frame[5] << 8));
+            g_encoderRightMm = (int16_t)((uint16_t)frame[6] |
+                               ((uint16_t)frame[7] << 8));
+            ++g_encoderVersion;
+            continue;
+        }
+        g_ackCommand = frame[2];
+        g_ackSeq = frame[3];
+        g_ackStatus = frame[4];
+        ++g_ackVersion;
     }
 }
 
-
-
-/***循迹函数****/
-void trace_module(void)
+static uint8_t BitCount5(uint8_t value)
 {
-    RouteStage stage = ROUTE_FIRST_JUNCTION;
-    unsigned int clear_count = 0;
-    unsigned int special_count = 0;
-    unsigned int stage_run_samples = 0;
-    unsigned int finish_bar_count = 0;
-    unsigned int finish_gap_samples = 0;
-    FollowAction correction_candidate = FOLLOW_FORWARD;
-    unsigned int correction_samples = 0;
-    int armed = 0;
+    uint8_t count = 0;
+    value &= 0x1fU;
+    while (value != 0) {
+        count += value & 1U;
+        value >>= 1;
+    }
+    return count;
+}
 
-    if (!route_logic_self_check()) {
-        car_stop();
+static FollowAction Classify(uint8_t leftBlack, uint8_t rightBlack)
+{
+    if (leftBlack && rightBlack) return ACTION_SPECIAL;
+    if (leftBlack) return ACTION_LEFT;
+    if (rightBlack) return ACTION_RIGHT;
+    return ACTION_FORWARD;
+}
+
+static int ReadFiltered(FollowAction *action)
+{
+    WifiIotGpioValue left;
+    WifiIotGpioValue right;
+    uint8_t mask = (1U << SENSOR_FILTER_COUNT) - 1U;
+    if (GpioGetInputVal(IR_LEFT_GPIO, &left) != 0 ||
+        GpioGetInputVal(IR_RIGHT_GPIO, &right) != 0) return -1;
+    g_filter.leftHistory = (uint8_t)(((g_filter.leftHistory << 1) |
+        (left == WIFI_IOT_GPIO_VALUE0 ? 1U : 0U)) & mask);
+    g_filter.rightHistory = (uint8_t)(((g_filter.rightHistory << 1) |
+        (right == WIFI_IOT_GPIO_VALUE0 ? 1U : 0U)) & mask);
+    if (g_filter.samples < SENSOR_FILTER_COUNT) ++g_filter.samples;
+    *action = Classify(BitCount5(g_filter.leftHistory) >= SENSOR_FILTER_THRESHOLD,
+                       BitCount5(g_filter.rightHistory) >= SENSOR_FILTER_THRESHOLD);
+    return 0;
+}
+
+static void EventReset(uint8_t armed)
+{
+    g_event.active = 0;
+    g_event.armed = armed;
+    g_event.seenMask = 0;
+    g_event.leftHits = 0;
+    g_event.rightHits = 0;
+    g_event.samples = 0;
+    g_event.clearSamples = 0;
+}
+
+static int EventUpdate(FollowAction action)
+{
+    uint8_t leftBlack = action == ACTION_LEFT || action == ACTION_SPECIAL;
+    uint8_t rightBlack = action == ACTION_RIGHT || action == ACTION_SPECIAL;
+    if (!g_event.armed) {
+        if (action == ACTION_FORWARD) {
+            if (++g_event.clearSamples >= EVENT_REARM_WHITE_SAMPLES) EventReset(1);
+        } else {
+            g_event.clearSamples = 0;
+        }
+        return 0;
+    }
+    if (!g_event.active) {
+        if (!leftBlack && !rightBlack) return 0;
+        g_event.active = 1;
+    }
+    if (leftBlack) {
+        g_event.seenMask |= SEEN_LEFT;
+        if (g_event.leftHits < 255U) ++g_event.leftHits;
+    }
+    if (rightBlack) {
+        g_event.seenMask |= SEEN_RIGHT;
+        if (g_event.rightHits < 255U) ++g_event.rightHits;
+    }
+    if (++g_event.samples < EVENT_WINDOW_SAMPLES) return 0;
+    if (g_event.seenMask == (SEEN_LEFT | SEEN_RIGHT) &&
+        g_event.leftHits >= EVENT_SIDE_MIN_HITS &&
+        g_event.rightHits >= EVENT_SIDE_MIN_HITS) {
+        EventReset(0);
+        return 1;
+    }
+    EventReset(1);
+    return 0;
+}
+
+static const char *StateName(CarState state)
+{
+    switch (state) {
+    case STATE_WAIT_START: return "WAIT_START";
+    case STATE_FOLLOW: return "FOLLOW";
+    case STATE_EVENT_CANDIDATE: return "EVENT_CANDIDATE";
+    case STATE_EVENT_CHECK: return "EVENT_CHECK";
+    case STATE_JUNCTION: return "JUNCTION";
+    case STATE_MOVE_TO_JUNCTION_CENTER: return "MOVE_TO_JUNCTION_CENTER";
+    case STATE_SEARCH_LEFT_WAIT_BLACK: return "SEARCH_LEFT_WAIT_BLACK";
+    case STATE_SEARCH_LEFT_ON_BLACK: return "SEARCH_LEFT_ON_BLACK";
+    case STATE_SEARCH_LEFT_EXIT: return "SEARCH_LEFT_EXIT";
+    case STATE_SEARCH_RIGHT_WAIT_BLACK: return "SEARCH_RIGHT_WAIT_BLACK";
+    case STATE_SEARCH_RIGHT_ON_BLACK: return "SEARCH_RIGHT_ON_BLACK";
+    case STATE_SEARCH_RIGHT_EXIT: return "SEARCH_RIGHT_EXIT";
+    case STATE_CENTER_SCAN_OPPOSITE: return "CENTER_SCAN_OPPOSITE";
+    case STATE_CENTER_RETURN_HALF: return "CENTER_RETURN_HALF";
+    case STATE_CENTER_DONE: return "CENTER_DONE";
+    case STATE_CENTER_FAIL: return "CENTER_FAIL";
+    case STATE_SEARCH_FAIL: return "SEARCH_FAIL";
+    case STATE_DEAD_END: return "DEAD_END";
+    case STATE_DEAD_END_PROBE: return "DEAD_END_PROBE";
+    case STATE_TURN_BACK: return "TURN_BACK";
+    case STATE_RETURNING: return "RETURNING";
+    case STATE_RETURN_JUNCTION: return "RETURN_JUNCTION";
+    case STATE_FINISH: return "FINISH";
+    default: return "FAULT";
+    }
+}
+
+static void Transition(CarState *state, CarState next)
+{
+    printf("[STATE] %s -> %s\r\n", StateName(*state), StateName(next));
+    *state = next;
+}
+
+static void StopWithReason(const char *reason)
+{
+    printf("[STOP] %s\r\n", reason);
+    StopCar();
+}
+
+static const char *ActionName(FollowAction action)
+{
+    switch (action) {
+    case ACTION_LEFT: return "BW";
+    case ACTION_RIGHT: return "WB";
+    case ACTION_SPECIAL: return "BB";
+    default: return "WW";
+    }
+}
+
+static void FollowLine(FollowAction action, FollowAction *lastDirection,
+                       uint16_t *holdSamples, uint16_t *lostSamples)
+{
+    if (action == ACTION_LEFT || action == ACTION_RIGHT) {
+        if (action == *lastDirection) {
+            if (*holdSamples < 0xffffU) ++*holdSamples;
+        } else {
+            *lastDirection = action;
+            *holdSamples = 1;
+        }
+        *lostSamples = 0;
+    } else if (action == ACTION_FORWARD) {
+        ++*lostSamples;
+    }
+    if (action == ACTION_LEFT) {
+        if (*holdSamples <= SOFT_ADJUST_SAMPLES)
+            SetSpeed(SOFT_INNER_SPEED_MM_S, SOFT_OUTER_SPEED_MM_S);
+        else if (*holdSamples <= NORMAL_ADJUST_SAMPLES)
+            SetSpeed(NORMAL_INNER_SPEED_MM_S, NORMAL_OUTER_SPEED_MM_S);
+        else
+            SetSpeed(STRONG_INNER_SPEED_MM_S, STRONG_OUTER_SPEED_MM_S);
+    } else if (action == ACTION_RIGHT) {
+        if (*holdSamples <= SOFT_ADJUST_SAMPLES)
+            SetSpeed(SOFT_OUTER_SPEED_MM_S, SOFT_INNER_SPEED_MM_S);
+        else if (*holdSamples <= NORMAL_ADJUST_SAMPLES)
+            SetSpeed(NORMAL_OUTER_SPEED_MM_S, NORMAL_INNER_SPEED_MM_S);
+        else
+            SetSpeed(STRONG_OUTER_SPEED_MM_S, STRONG_INNER_SPEED_MM_S);
+    } else if (*lostSamples <= LOST_MEMORY_SAMPLES && *lastDirection == ACTION_LEFT) {
+        SetSpeed(SOFT_INNER_SPEED_MM_S, SOFT_OUTER_SPEED_MM_S);
+    } else if (*lostSamples <= LOST_MEMORY_SAMPLES && *lastDirection == ACTION_RIGHT) {
+        SetSpeed(SOFT_OUTER_SPEED_MM_S, SOFT_INNER_SPEED_MM_S);
+    } else {
+        SetSpeed(BASE_SPEED_MM_S, BASE_SPEED_MM_S);
+        if (*lostSamples > LOST_MEMORY_SAMPLES) {
+            *lastDirection = ACTION_FORWARD;
+            *holdSamples = 0;
+        }
+    }
+}
+
+static int LogicSelfCheck(void)
+{
+    return Classify(0, 0) == ACTION_FORWARD &&
+           Classify(1, 0) == ACTION_LEFT &&
+           Classify(0, 1) == ACTION_RIGHT &&
+           Classify(1, 1) == ACTION_SPECIAL &&
+           g_route[0] == DIR_LEFT && g_route[1] == DIR_RIGHT &&
+           g_route[2] == DIR_RIGHT && CENTER_BASE_MM_S > CENTER_DELTA_MM_S;
+}
+
+static void RouteTask(void *argument)
+{
+    CarState state = STATE_WAIT_START;
+    FollowAction action = ACTION_FORWARD;
+    FollowAction lastDirection = ACTION_FORWARD;
+    uint16_t correctionSamples = 0;
+    uint16_t lostSamples = LOST_MEMORY_SAMPLES + 1;
+    uint16_t lockSamples = 0;
+    uint16_t markerGapSamples = 0;
+    uint16_t raceSamples = 0;
+    uint16_t debugSamples = 0;
+    uint16_t searchSamples = 0;
+    uint8_t searchBlackSamples = 0;
+    uint8_t searchWhiteSamples = 0;
+    uint8_t markerCount = 0;
+    uint8_t routeIndex = 0;
+    uint8_t returningFromDeadEnd = 0;
+    uint8_t branchValid = 0;
+    FollowAction lastLoggedAction = (FollowAction)255;
+    Direction searchTarget = DIR_LEFT;
+    Direction branchTaken = DIR_LEFT;
+    Direction centerDirection = DIR_LEFT;
+    uint16_t centerSamples = 0;
+    uint16_t centerMetric = 0;
+    int16_t centerStartLeft = 0;
+    int16_t centerStartRight = 0;
+    int16_t centerReturnLeft = 0;
+    int16_t centerReturnRight = 0;
+    uint8_t centerStartValid = 0;
+    uint8_t centerBlackSamples = 0;
+    uint8_t centerEncoderVersion = 0;
+    uint8_t centerEncoderPoll = 0;
+    (void)argument;
+
+    if (!LogicSelfCheck()) {
+        StopWithReason("SELF_CHECK_FAILED");
         printf("route logic self-check failed\r\n");
         return;
     }
+    EventReset(1);
+    printf("firmware: v14.2 route events and bounded active center\r\n");
+    printf("route: Hi3861 sensors, STM32 encoder motion\r\n");
 
-    printf("route start: leave the left start area\r\n");
-
-    while (stage != ROUTE_DONE) {
-        FollowAction action = read_sensors();
-
-        if (finish_bar_count > 0 &&
-            ++finish_gap_samples > FINISH_SECOND_BAR_MAX_SAMPLES) {
-            finish_bar_count = 0;
-            finish_gap_samples = 0;
-            printf("finish marker first bar expired\r\n");
+    while (state != STATE_FINISH && state != STATE_FAULT) {
+        if (ReadFiltered(&action) != 0) {
+            StopWithReason("IR_READ_ERROR");
+            Transition(&state, STATE_FAULT);
+            break;
         }
-
-        if (!armed) {
-            car_forward();
-
-            if (action == FOLLOW_FORWARD) {
-                if (++clear_count >= CLEAR_CONFIRM_SAMPLES) {
-                    armed = 1;
-                    clear_count = 0;
-                    stage_run_samples = 0;
-                    printf("route armed: stage=%d\r\n", stage);
+        if (markerCount > 0 && ++markerGapSamples > START_FINISH_GAP_MAX_SAMPLES) {
+            markerCount = 0;
+            markerGapSamples = 0;
+            if (state != STATE_WAIT_START && routeIndex >= ROUTE_COUNT) {
+                printf("[ERROR] ROUTE INDEX OVERFLOW index=%u\r\n", routeIndex);
+                StopWithReason("ROUTE_INDEX_OVERFLOW");
+                Transition(&state, STATE_FAULT);
+            }
+        }
+        if (lockSamples > 0) --lockSamples;
+        if (state != STATE_WAIT_START && raceSamples < 0xffffU) ++raceSamples;
+#if LINE_DEBUG
+        if (action != lastLoggedAction || ++debugSamples >= DEBUG_PERIOD_SAMPLES) {
+            debugSamples = 0;
+            lastLoggedAction = action;
+            printf("[IR] %s state=%s seen=0x%02x junction=%u\r\n",
+                   ActionName(action), StateName(state), g_event.seenMask,
+                   routeIndex);
+        }
+#endif
+        if (state == STATE_WAIT_START) {
+            SetSpeed(START_SPEED_MM_S, START_SPEED_MM_S);
+            if (EventUpdate(action)) {
+                if (++markerCount >= 2) {
+                    markerCount = 0;
+                    markerGapSamples = 0;
+                    raceSamples = 0;
+                    lockSamples = JUNCTION_LOCK_SAMPLES;
+                    printf("[EVENT] Double line detected: race started\r\n");
+                    Transition(&state, STATE_FOLLOW);
+                } else {
+                    markerGapSamples = 0;
+                    printf("[EVENT] Start marker first bar\r\n");
+                }
+            }
+        } else if (state == STATE_FOLLOW || state == STATE_RETURNING) {
+            FollowLine(action, &lastDirection, &correctionSamples, &lostSamples);
+            if (lockSamples == 0 && EventUpdate(action)) {
+                Transition(&state, state == STATE_RETURNING
+                    ? STATE_RETURN_JUNCTION : STATE_EVENT_CHECK);
+            }
+        } else if (state == STATE_EVENT_CHECK) {
+            StopWithReason("EVENT_CHECK");
+            if (routeIndex < ROUTE_COUNT) {
+                searchTarget = g_route[routeIndex];
+                printf("[ROUTE EVENT] index=%u action=%s\r\n", routeIndex,
+                       searchTarget == DIR_LEFT ? "LEFT" : "RIGHT");
+                Transition(&state, STATE_JUNCTION);
+            } else if (raceSamples >= MIN_RACE_SAMPLES) {
+                if (++markerCount >= 2) {
+                    printf("[EVENT] Double line detected: finish\r\n");
+                    StopWithReason("FINISH");
+                    Transition(&state, STATE_FINISH);
+                } else {
+                    markerGapSamples = 0;
+                    printf("[EVENT] Finish marker first bar\r\n");
+                    Transition(&state, STATE_FOLLOW);
                 }
             } else {
-                clear_count = 0;
+                lockSamples = EVENT_WINDOW_SAMPLES;
+                Transition(&state, STATE_FOLLOW);
             }
-            hi_sleep(CONTROL_PERIOD_MS);
-            continue;
-        }
-
-        if (action != FOLLOW_SPECIAL) {
-            special_count = 0;
-            if (stage_run_samples < 0xffffffffU) {
-                stage_run_samples++;
+        } else if (state == STATE_JUNCTION) {
+                StartMotion(CMD_MOVE_DISTANCE, JUNCTION_CENTER_MM,
+                            POSITION_SPEED_MM_S);
+                Transition(&state, STATE_MOVE_TO_JUNCTION_CENTER);
+        } else if (state == STATE_MOVE_TO_JUNCTION_CENTER) {
+            int motion = MotionUpdate();
+            if (motion < 0) {
+                StopWithReason("JUNCTION_CENTER_FAILED");
+                Transition(&state, STATE_FAULT);
+            } else if (motion > 0) {
+                searchSamples = 0;
+                searchBlackSamples = 0;
+                searchWhiteSamples = 0;
+                if (searchTarget == DIR_LEFT) {
+                    Transition(&state, STATE_SEARCH_LEFT_WAIT_BLACK);
+                } else {
+                    Transition(&state, STATE_SEARCH_RIGHT_WAIT_BLACK);
+                }
             }
-            follow_lane(confirm_lane_action(action, &correction_candidate,
-                                            &correction_samples),
-                        correction_samples);
-            hi_sleep(CONTROL_PERIOD_MS);
-            continue;
-        }
-
-        correction_candidate = FOLLOW_FORWARD;
-        correction_samples = 0;
-
-        if (stage_run_samples < MIN_STAGE_RUN_SAMPLES &&
-            !(stage == ROUTE_FINISH && finish_bar_count == 1)) {
-            special_count = 0;
-            car_forward();
-            hi_sleep(CONTROL_PERIOD_MS);
-            continue;
-        }
-
-        if (++special_count < EVENT_CONFIRM_SAMPLES) {
-            car_forward();
-            hi_sleep(CONTROL_PERIOD_MS);
-            continue;
-        }
-
-        special_count = 0;
-        armed = 0;
-        last_correction = FOLLOW_FORWARD;
-        correction_hold = 0;
-        stage_run_samples = 0;
-
-        if (stage == ROUTE_FIRST_JUNCTION) {
-            printf("junction 1: turn left\r\n");
-            if (take_junction(1)) {
-                printf("junction 1: branch acquired\r\n");
-                stage = ROUTE_SECOND_JUNCTION;
+        } else if (state == STATE_SEARCH_LEFT_WAIT_BLACK ||
+                   state == STATE_SEARCH_RIGHT_WAIT_BLACK) {
+            uint8_t targetBlack = searchTarget == DIR_LEFT
+                ? (action == ACTION_LEFT || action == ACTION_SPECIAL)
+                : (action == ACTION_RIGHT || action == ACTION_SPECIAL);
+            SetSpeed(searchTarget == DIR_LEFT ? -POSITION_SPEED_MM_S : POSITION_SPEED_MM_S,
+                     searchTarget == DIR_LEFT ? POSITION_SPEED_MM_S : -POSITION_SPEED_MM_S);
+            ++searchSamples;
+            if (targetBlack) {
+                if (++searchBlackSamples >= SEARCH_BLACK_SAMPLES) {
+                    Transition(&state, searchTarget == DIR_LEFT
+                        ? STATE_SEARCH_LEFT_ON_BLACK : STATE_SEARCH_RIGHT_ON_BLACK);
+                }
             } else {
-                printf("junction 1: turn timeout, stage unchanged\r\n");
+                searchBlackSamples = 0;
             }
-        } else if (stage == ROUTE_SECOND_JUNCTION) {
-            printf("junction 2: turn right\r\n");
-            if (take_junction(0)) {
-                printf("junction 2: branch acquired\r\n");
-                stage = ROUTE_FINISH;
+            if (searchSamples >= SEARCH_TIMEOUT_SAMPLES) {
+                Transition(&state, STATE_SEARCH_FAIL);
+            }
+        } else if (state == STATE_SEARCH_LEFT_ON_BLACK ||
+                   state == STATE_SEARCH_RIGHT_ON_BLACK) {
+            SetSpeed(searchTarget == DIR_LEFT ? -POSITION_SPEED_MM_S : POSITION_SPEED_MM_S,
+                     searchTarget == DIR_LEFT ? POSITION_SPEED_MM_S : -POSITION_SPEED_MM_S);
+            ++searchSamples;
+            if (action == ACTION_FORWARD) {
+                searchWhiteSamples = 1;
+                Transition(&state, searchTarget == DIR_LEFT
+                    ? STATE_SEARCH_LEFT_EXIT : STATE_SEARCH_RIGHT_EXIT);
+            }
+            if (searchSamples >= SEARCH_TIMEOUT_SAMPLES) {
+                Transition(&state, STATE_SEARCH_FAIL);
+            }
+        } else if (state == STATE_SEARCH_LEFT_EXIT ||
+                   state == STATE_SEARCH_RIGHT_EXIT) {
+            SetSpeed(searchTarget == DIR_LEFT ? -POSITION_SPEED_MM_S : POSITION_SPEED_MM_S,
+                     searchTarget == DIR_LEFT ? POSITION_SPEED_MM_S : -POSITION_SPEED_MM_S);
+            ++searchSamples;
+            if (action == ACTION_FORWARD) {
+                if (++searchWhiteSamples >= SEARCH_WHITE_SAMPLES) {
+                    StopWithReason("BRANCH_ACQUIRED");
+                    printf("[JUNCTION] branch acquired\r\n");
+                    branchTaken = searchTarget;
+                    branchValid = 1;
+                    if (returningFromDeadEnd) {
+                        returningFromDeadEnd = 0;
+                        lockSamples = JUNCTION_LOCK_SAMPLES;
+                        EventReset(0);
+                        Transition(&state, STATE_FOLLOW);
+                    } else {
+                        centerDirection = searchTarget;
+                        centerSamples = 0;
+                        centerMetric = 0;
+                        centerStartValid = 0;
+                        centerBlackSamples = 0;
+                        centerEncoderVersion = g_encoderVersion;
+                        centerEncoderPoll = CENTER_ENCODER_POLL_SAMPLES;
+                        EventReset(0);
+                        printf("[CENTER] start after %s\r\n",
+                               centerDirection == DIR_LEFT ? "LEFT" : "RIGHT");
+                        Transition(&state, STATE_CENTER_SCAN_OPPOSITE);
+                    }
+                }
             } else {
-                printf("junction 2: turn timeout, stage unchanged\r\n");
+                searchWhiteSamples = 0;
+                Transition(&state, searchTarget == DIR_LEFT
+                    ? STATE_SEARCH_LEFT_ON_BLACK : STATE_SEARCH_RIGHT_ON_BLACK);
             }
-        } else if (finish_bar_count == 0) {
-            finish_bar_count = 1;
-            finish_gap_samples = 0;
-            printf("finish marker first bar\r\n");
-        } else {
-            car_stop();
-            printf("finish marker second bar reached\r\n");
-            stage = ROUTE_DONE;
+            if (searchSamples >= SEARCH_TIMEOUT_SAMPLES &&
+                (state == STATE_SEARCH_LEFT_EXIT ||
+                 state == STATE_SEARCH_RIGHT_EXIT)) {
+                Transition(&state, STATE_SEARCH_FAIL);
+            }
+        } else if (state == STATE_CENTER_SCAN_OPPOSITE) {
+            uint8_t oppositeBlack = centerDirection == DIR_RIGHT
+                ? (action == ACTION_LEFT || action == ACTION_SPECIAL)
+                : (action == ACTION_RIGHT || action == ACTION_SPECIAL);
+            SetSpeed(centerDirection == DIR_RIGHT
+                         ? CENTER_BASE_MM_S + CENTER_DELTA_MM_S
+                         : CENTER_BASE_MM_S - CENTER_DELTA_MM_S,
+                     centerDirection == DIR_RIGHT
+                         ? CENTER_BASE_MM_S - CENTER_DELTA_MM_S
+                         : CENTER_BASE_MM_S + CENTER_DELTA_MM_S);
+            if (++centerEncoderPoll >= CENTER_ENCODER_POLL_SAMPLES) {
+                centerEncoderPoll = 0;
+                RequestEncoders();
+            }
+            if (g_encoderVersion != centerEncoderVersion) {
+                centerEncoderVersion = g_encoderVersion;
+                if (!centerStartValid) {
+                    centerStartLeft = g_encoderLeftMm;
+                    centerStartRight = g_encoderRightMm;
+                    centerStartValid = 1;
+                } else {
+                    centerMetric = EncoderTurnMetric(centerStartLeft,
+                        centerStartRight, g_encoderLeftMm, g_encoderRightMm);
+                }
+            }
+            if (centerStartValid && oppositeBlack) {
+                if (++centerBlackSamples >= CENTER_BLACK_SAMPLES &&
+                    centerMetric > 0U) {
+                    centerReturnLeft = g_encoderLeftMm;
+                    centerReturnRight = g_encoderRightMm;
+                    centerSamples = 0;
+                    centerEncoderPoll = CENTER_ENCODER_POLL_SAMPLES;
+                    printf("[CENTER] opposite edge found M=%u\r\n", centerMetric);
+                    printf("[CENTER] return half\r\n");
+                    Transition(&state, STATE_CENTER_RETURN_HALF);
+                }
+            } else {
+                centerBlackSamples = 0;
+            }
+            if (centerMetric >= CENTER_MAX_METRIC_MM ||
+                ++centerSamples >= CENTER_TIMEOUT_SAMPLES) {
+                Transition(&state, STATE_CENTER_FAIL);
+            }
+        } else if (state == STATE_CENTER_RETURN_HALF) {
+            uint16_t returnMetric;
+            SetSpeed(centerDirection == DIR_RIGHT
+                         ? CENTER_BASE_MM_S - CENTER_DELTA_MM_S
+                         : CENTER_BASE_MM_S + CENTER_DELTA_MM_S,
+                     centerDirection == DIR_RIGHT
+                         ? CENTER_BASE_MM_S + CENTER_DELTA_MM_S
+                         : CENTER_BASE_MM_S - CENTER_DELTA_MM_S);
+            if (++centerEncoderPoll >= CENTER_ENCODER_POLL_SAMPLES) {
+                centerEncoderPoll = 0;
+                RequestEncoders();
+            }
+            returnMetric = EncoderTurnMetric(centerReturnLeft, centerReturnRight,
+                                             g_encoderLeftMm, g_encoderRightMm);
+            if (returnMetric >= (uint16_t)((centerMetric + 1U) / 2U)) {
+                Transition(&state, STATE_CENTER_DONE);
+            } else if (returnMetric >= CENTER_MAX_METRIC_MM ||
+                       ++centerSamples >= CENTER_TIMEOUT_SAMPLES) {
+                Transition(&state, STATE_CENTER_FAIL);
+            }
+        } else if (state == STATE_CENTER_DONE || state == STATE_CENTER_FAIL) {
+            uint8_t oldIndex = routeIndex;
+            if (state == STATE_CENTER_DONE)
+                printf("[CENTER] done\r\n");
+            else
+                printf("[CENTER] fail\r\n");
+            SetSpeed(BASE_SPEED_MM_S, BASE_SPEED_MM_S);
+            centerSamples = 0;
+            centerMetric = 0;
+            centerStartValid = 0;
+            centerBlackSamples = 0;
+            searchSamples = 0;
+            searchBlackSamples = 0;
+            searchWhiteSamples = 0;
+            correctionSamples = 0;
+            lostSamples = LOST_MEMORY_SAMPLES + 1U;
+            lastDirection = ACTION_FORWARD;
+            ++routeIndex;
+            printf("[JUNCTION] index %u -> %u\r\n", oldIndex, routeIndex);
+            lockSamples = JUNCTION_LOCK_SAMPLES;
+            EventReset(0);
+            Transition(&state, STATE_FOLLOW);
+        } else if (state == STATE_SEARCH_FAIL) {
+            StopWithReason("SEARCH_FAIL");
+            Transition(&state, STATE_FAULT);
+        } else if (state == STATE_DEAD_END) {
+            StopWithReason("DEAD_END_CONFIRMED");
+            StartMotion(CMD_MOVE_DISTANCE, DEAD_END_PROBE_MM, POSITION_SPEED_MM_S);
+            Transition(&state, STATE_DEAD_END_PROBE);
+        } else if (state == STATE_DEAD_END_PROBE) {
+            int motion = MotionUpdate();
+            if (motion < 0) {
+                StopWithReason("DEAD_END_PROBE_FAILED");
+                Transition(&state, STATE_FAULT);
+            } else if (motion > 0) {
+                printf("[TURNBACK] reason=DEAD_END_CONFIRMED\r\n");
+                StartMotion(CMD_TURN_ANGLE, TURN_BACK_X10_DEG, POSITION_SPEED_MM_S);
+                Transition(&state, STATE_TURN_BACK);
+            }
+        } else if (state == STATE_TURN_BACK) {
+            int motion = MotionUpdate();
+            if (!branchValid || motion < 0) {
+                StopWithReason("RETURN_SEARCH_FAIL");
+                Transition(&state, STATE_FAULT);
+            } else if (motion > 0) {
+                returningFromDeadEnd = 1;
+                lockSamples = JUNCTION_LOCK_SAMPLES;
+                EventReset(0);
+                Transition(&state, STATE_RETURNING);
+            }
+        } else if (state == STATE_RETURN_JUNCTION) {
+            searchTarget = branchTaken == DIR_LEFT ? DIR_RIGHT : DIR_LEFT;
+            printf("[JUNCTION] returning target=%s\r\n",
+                   searchTarget == DIR_LEFT ? "LEFT" : "RIGHT");
+            StartMotion(CMD_MOVE_DISTANCE, JUNCTION_CENTER_MM, POSITION_SPEED_MM_S);
+            Transition(&state, STATE_MOVE_TO_JUNCTION_CENTER);
         }
+        hi_sleep(SENSOR_SAMPLE_MS);
     }
-
-    car_stop();
+    printf(state == STATE_FINISH ? "route finished\r\n" : "route fault: stopped\r\n");
 }
 
-
-/*****任务创建*****/
-static void Tracing(void)
+static void TracingInit(void)
 {
-    GpioInit();//GPIO功能初始化
-
-    /**********************通讯串口初始化******************/
-    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD);//GPIO_11复用为UART2_TXD
-    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12, WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD);//GPIO_12复用为UART2_RX
-
-        WifiIotUartAttribute uart_attr2 = {
-        //波特率: 115200
+    WifiIotUartAttribute uart = {
         .baudRate = 115200,
-        //数据位: 8bits
         .dataBits = 8,
         .stopBits = 1,
         .parity = 0,
-        };
-    UartInit(WIFI_IOT_UART_IDX_2, &uart_attr2, NULL);
-
-    /**********************红外初始化******************/
-    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13,WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
-    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14,WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
-    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_13,WIFI_IOT_GPIO_DIR_IN);
-    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_14,WIFI_IOT_GPIO_DIR_IN);
-
-    osThreadAttr_t attr;
-    attr.attr_bits = 0U;//设置osThraedJoin是否可以使用
-    attr.cb_mem = NULL;//控制块指针设置
-    attr.cb_size = 0U;//控制块指针大小
-    attr.stack_mem = NULL;//任务栈设置
-    attr.stack_size = 1024 * 4;//任务栈大小
-    //创建任务1
-    attr.name = "trace_module";//创建任务名称
-    attr.priority = 25;//任务优先级
-    if (osThreadNew((osThreadFunc_t)trace_module, NULL, &attr) == NULL)
-    {
-        printf("Falied to create trace_module!\n");
-    }
+    };
+    osThreadAttr_t rxAttr = {
+        .name = "MotionAckRx", .attr_bits = 0U, .cb_mem = NULL, .cb_size = 0U,
+        .stack_mem = NULL, .stack_size = 3072, .priority = 27,
+    };
+    osThreadAttr_t routeAttr = {
+        .name = "InfraredRoute", .attr_bits = 0U, .cb_mem = NULL, .cb_size = 0U,
+        .stack_mem = NULL, .stack_size = 6144, .priority = 25,
+    };
+    GpioInit();
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_11, WIFI_IOT_IO_FUNC_GPIO_11_UART2_TXD);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_12, WIFI_IOT_IO_FUNC_GPIO_12_UART2_RXD);
+    if (UartInit(WIFI_IOT_UART_IDX_2, &uart, NULL) != 0) return;
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_IO_FUNC_GPIO_13_GPIO);
+    IoSetFunc(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_IO_FUNC_GPIO_14_GPIO);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_13, WIFI_IOT_GPIO_DIR_IN);
+    GpioSetDir(WIFI_IOT_IO_NAME_GPIO_14, WIFI_IOT_GPIO_DIR_IN);
+    if (osThreadNew(UartReceiveTask, NULL, &rxAttr) == NULL) return;
+    (void)osThreadNew(RouteTask, NULL, &routeAttr);
 }
 
-APP_FEATURE_INIT(Tracing);//启动任务
+APP_FEATURE_INIT(TracingInit);

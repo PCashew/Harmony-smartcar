@@ -148,3 +148,25 @@ void Protocol_SendStatus(u8 command, u8 seq, u8 status)
         while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET) { }
     }
 }
+
+void Protocol_SendValues(u8 command, u8 seq, s16 value1, s16 value2)
+{
+    u8 frame[PROTOCOL_FRAME_SIZE];
+    u8 i;
+
+    frame[0] = PROTOCOL_HEAD_0;
+    frame[1] = PROTOCOL_HEAD_1;
+    frame[2] = (u8)(command | 0x80U);
+    frame[3] = seq;
+    frame[4] = (u8)((u16)value1 & 0xffU);
+    frame[5] = (u8)(((u16)value1 >> 8) & 0xffU);
+    frame[6] = (u8)((u16)value2 & 0xffU);
+    frame[7] = (u8)(((u16)value2 >> 8) & 0xffU);
+    frame[8] = Protocol_Checksum(frame);
+    frame[9] = PROTOCOL_TAIL;
+
+    for (i = 0; i < PROTOCOL_FRAME_SIZE; ++i) {
+        USART_SendData(USART1, frame[i]);
+        while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET) { }
+    }
+}

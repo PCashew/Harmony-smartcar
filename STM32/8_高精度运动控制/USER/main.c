@@ -10,6 +10,8 @@ int main(void)
     u8 event_status;
     s16 param1;
     s16 param2;
+    s16 telemetry1;
+    s16 telemetry2;
     MotionStatus result;
 
     Stm32_Clock_Init(9);
@@ -42,6 +44,10 @@ int main(void)
             case CMD_RETRACE_PATH:
                 result = Motion_RetracePath((u16)param1, (u16)param2, seq);
                 break;
+            case CMD_GET_ENCODERS:
+                Motion_GetEncoderMm(&telemetry1, &telemetry2);
+                Protocol_SendValues(command, seq, telemetry1, telemetry2);
+                continue;
             default:
                 result = MOTION_STATUS_BAD_PARAM;
                 break;

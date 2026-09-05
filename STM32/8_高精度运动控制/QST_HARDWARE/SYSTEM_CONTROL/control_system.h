@@ -29,5 +29,6 @@ MotionStatus Motion_MoveDistance(s16 distance_mm, u16 max_speed_mm_s, u8 seq);
 MotionStatus Motion_TurnAngle(s16 angle_x10_deg, u16 max_speed_mm_s, u8 seq);
 MotionStatus Motion_RetracePath(u16 max_distance_mm, u16 max_speed_mm_s, u8 seq);
 u8 Motion_GetEvent(u8 *command, u8 *seq, u8 *status);
+void Motion_GetEncoderMm(s16 *left_mm, s16 *right_mm);
 
 #endif
